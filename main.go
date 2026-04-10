@@ -63,22 +63,16 @@ const (
 
 // ── block types ──────────────────────────────────────────────────────────────
 
-// transaction holds only the fields the miner needs to compute txRoot.
-// The full transaction (with signatures etc.) is provided by the node;
-// the miner only reads the pre-computed transaction hash.
-type transaction struct {
-	Hash string `json:"hash"`
-}
-
-// block mirrors the node's Block struct. Fields beyond those needed for PoW
-// are captured by RawMessage so they round-trip to the node unchanged.
+// block mirrors the node's Block struct. Transactions are stored as raw JSON
+// so the full transaction data (ID, type, inputs, outputs, signatures) round-trips
+// to the node unchanged on submit. Only the hash field is read for txRoot.
 type block struct {
-	Index        int           `json:"index"`
-	PreviousHash string        `json:"previousHash"`
-	Timestamp    float64       `json:"timestamp"`
-	Nonce        int64         `json:"nonce"`
-	Transactions []transaction `json:"transactions"`
-	Hash         string        `json:"hash"`
+	Index        int               `json:"index"`
+	PreviousHash string            `json:"previousHash"`
+	Timestamp    float64           `json:"timestamp"`
+	Nonce        int64             `json:"nonce"`
+	Transactions []json.RawMessage `json:"transactions"`
+	Hash         string            `json:"hash"`
 }
 
 // candidateResp is the JSON returned by GET /miner/candidate.
@@ -113,9 +107,15 @@ func argon2BlockHash(data string) string {
 // txRoot commits to the block's transaction set without embedding full
 // ML-DSA44 signatures in the PoW hash. Each transaction hash already commits
 // to that transaction's complete content.
-func txRoot(txs []transaction) string {
+// The hash field is extracted from each raw JSON message; all other fields
+// are ignored for hashing but preserved intact for submission to the node.
+func txRoot(txs []json.RawMessage) string {
 	parts := make([]string, len(txs))
-	for i, tx := range txs {
+	for i, raw := range txs {
+		var tx struct {
+			Hash string `json:"hash"`
+		}
+		_ = json.Unmarshal(raw, &tx)
 		parts[i] = tx.Hash
 	}
 	return sha256hex(strings.Join(parts, ""))
@@ -229,6 +229,12 @@ func httpPost(url string, payload interface{}) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+// isHTTPError reports whether err is an HTTP-level error (4xx/5xx response)
+// as opposed to a network-level failure (connection refused, timeout, etc.).
+func isHTTPError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "HTTP")
 }
 
 func truncHash(h string) string {
@@ -396,7 +402,12 @@ func main() {
 		if err := httpPost(node+"/miner/submit", solved); err != nil {
 			errors++
 			fmt.Printf("[%s] submit error: %v\n", time.Now().Format("15:04:05"), err)
-			pool.markFailed()
+			// A 400 rejection (stale block, lost race) is not a peer failure —
+			// the peer is healthy, we just lost the race. Only mark the peer
+			// failed on network-level errors (connection refused, timeout, etc.).
+			if !isHTTPError(err) {
+				pool.markFailed()
+			}
 			continue
 		}
 
